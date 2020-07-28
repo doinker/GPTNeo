@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import tensorflow.compat.v1 as tf
 import os
+import math
 
 # --------------------------------------------------------------------------------
 # INPUT FNS:
@@ -95,7 +96,7 @@ def text_dataset(files, params, stitch, datatype, batch=True):
     return dataset
 
 
-def generic_text(params, eval=False):
+def generic_text(params, batch_size, eval=False):
     # params["datasets"] = [(train glob, eval_glob, stitch, ["random_sample", "sample", "chunk"] weight)]
     # , dsets=[["bundestag_*.tfrecords", "", 10, "random_sample", 1.0]]
     i = 0 if not eval else 1
@@ -110,7 +111,14 @@ def generic_text(params, eval=False):
     weights = [dataset[4] for dataset in params["datasets"]]
 
     dataset = tf.data.experimental.sample_from_datasets(datasets, weights=weights)
-    dataset = dataset.batch(params["train_batch_size"], drop_remainder=True).prefetch(params["iterations"] * 2)
+    dataset = dataset.batch(batch_size, drop_remainder=True).prefetch(params["iterations"] * 2)
 
     return dataset
+
+def batch_size_mapper(params, current_step):
+    batch_size_schedule = params['train_batch_size_schedule']
+    for i in range(len(batch_size_schedule)):
+        if batch_size_schedule[i][0] <= current_step:
+            current_batch_size = batch_size_schedule[i][1]
+    return current_batch_size
 

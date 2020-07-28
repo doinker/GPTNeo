@@ -14,7 +14,7 @@ from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.tpu import tpu_config  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu_estimator  # pylint: disable=g-direct-tensorflow-import
 from tensorflow_estimator.python.estimator import estimator as estimator_lib
-from inputs import generic_text
+from inputs import generic_text, batch_size_mapper
 from model_fns import model_fn
 
 FLAGS = flags.FLAGS
@@ -85,29 +85,44 @@ def run_model_tpu():
             iterations_per_loop=iterations_per_loop,
             num_cores_per_replica=1,
             per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST))
-    classifier = tpu_estimator.TPUEstimator(
-        use_tpu=True,
-        model_fn=model_fn,
-        config=config,
-        train_batch_size=params["train_batch_size"],
-        eval_batch_size=params["train_batch_size"],
-        params=params)
-    current_step = int(estimator_lib._load_global_step_from_checkpoint_dir(
-        params["model_path"]))
+
+
+    current_step = int(estimator_lib._load_global_step_from_checkpoint_dir(params["model_path"]))
     logging.info('Current step %d', current_step)
+    
     if FLAGS.steps_per_checkpoint == 0:
         classifier.train(input_fn=partial(generic_text, eval=False), max_steps=params["train_batch_size"])
         return
     if params["eval_steps"] > 0:
         # if eval is on - stop and eval every ckpt
         while current_step < params["train_steps"]:
+
+
+            current_batch_size = batch_size_mapper(params, current_step)
+
+            params['train_batch_size'] = current_batch_size
+            print("\n\n###########################################\n\n")
+            print("current step", current_step)
+            print("current batch size", current_batch_size)
+            print("\n\n###########################################\n\n")
+            classifier = tpu_estimator.TPUEstimator(
+                use_tpu=True,
+                model_fn=model_fn,
+                config=config,
+                train_batch_size=current_batch_size,
+                eval_batch_size=params["eval_batch_size"],
+                params=params)
+
             next_checkpoint = min(current_step + FLAGS.steps_per_checkpoint,
                                   params["train_steps"])
-            classifier.train(input_fn=partial(generic_text, eval=False), max_steps=next_checkpoint)
+
+            classifier.train(input_fn=partial(generic_text, batch_size = current_batch_size, eval=False), max_steps=next_checkpoint)
+
             current_step = next_checkpoint
             logging.info('Starting to evaluate.')
             eval_results = classifier.evaluate(
-                input_fn=partial(generic_text, eval=False),
+                #input_fn=partial(generic_text, batch_size=params['eval_batch_size'], eval=False),
+                input_fn=partial(generic_text, batch_size=current_batch_size, eval=False),
                 steps=params["eval_steps"])
             logging.info('Eval results: %s', eval_results)
     else:

@@ -30,7 +30,7 @@ parser.add_argument('--new', action='store_true')
 parser.add_argument('--test', action='store_true')
 parser.add_argument('--predict', action='store_true')
 parser.add_argument('--no_delete_tpu', action='store_true')
-parser.add_argument('--heartbeat_timeout', type=int, default=1800) # kill and restart if nothing logged to tensorboard in this many seconds
+parser.add_argument('--heartbeat_timeout', type=int, default=36000) # kill and restart if nothing logged to tensorboard in this many seconds
 args = parser.parse_args()
 
 params = fetch_model_params(args.model)
@@ -155,7 +155,7 @@ def get_run_data(port):
 @ex.main
 def main(_run):
     print('Starting run', _run._id)
-    print('experiment main invoked with argv:', sys.argv)
+    print('experiment main invoked with argv:', " ".join(sys.argv))
     print('WARNING: please remember to remove old metric log files from the model directory.')
 
     os.makedirs('run_configs', exist_ok=True)

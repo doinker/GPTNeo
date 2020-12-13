@@ -3,316 +3,211 @@ import glob
 import json
 import os
 import time
-from multiprocessing import Pool
 from pathlib import Path
 
 import ftfy
-import numpy as np
 import tensorflow as tf
 from lm_dataformat import Reader
 from tokenizers import Tokenizer
 from transformers import GPT2Tokenizer, GPT2TokenizerFast
 from tqdm import tqdm
 from encoders import encode
-import sys, traceback
 import logging
+from multiprocessing import Pool, cpu_count
+from itertools import repeat
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--mode", type=str, choices=["chunks", "documents"], default="documents",
                     help="Whether a tfrecord example is a constant sized chunk or a full document")
-parser.add_argument("--base_dir", type=str, help="Path to where your files are located. Files ending in .zst are treated as \
+parser.add_argument("--input_dir", type=str, help="Path to where your files are located. Files ending in .zst are treated as \
                     archives, all others as raw text.")
-parser.add_argument("--files_per", type=int, default=200, help="Text files per tfrecord")
+parser.add_argument("--files_per", type=int, default=100000, help="Text files per tfrecord")
 parser.add_argument("--name", type=str, default="openwebtext",
                     help="Name of output files will be name_i.tfrecords where i is the number of the file")
-parser.add_argument("--output_dir", type=str, default="tfrecords", help="Where to put tfrecords")
-parser.add_argument("--log_dir", type=str, default="logs", help="Where to put logs")
-parser.add_argument("--processes", type=int, default=8,
-                    help="How many subprocesses to spawn. Should be ~number of cores")
-parser.add_argument("--encoder_path", type=str, default="byte-level-bpe.tokenizer.json", help="Path to encoder files")
-parser.add_argument("--use_gpt2_tokenizer", action="store_true", help="Use GPT2 tokenizer as encoder")
+parser.add_argument("--output_dir", type=str, default="./tfrecords", help="Where to put tfrecords")
+parser.add_argument("--encoder_path", type=str, help="Path to encoder files, or leave unspecified to use GPT2 tokenizer")
 parser.add_argument("--minimum_size", type=int, default=100, help="Minimum size a document has to be to be included")
 parser.add_argument("--no_ftfy", action="store_true", help="If set skips unicode normalization with ftfy")
-parser.add_argument("--separator", type=str, default="[0]", help="separator to place between files in chunk mode")
-parser.add_argument("--chunk_size", type=int, default=2048, help="How big a chunk should be in chunk mode")
+parser.add_argument("--separator", nargs="+", type=int, default=[50256], help="separator to place between files in chunk mode")
+parser.add_argument("--chunk_size", type=int, default=2048, help="How big a chunk should be in chunk mode. "
+                                                                 "Should equal your model's context size")
 parser.add_argument("--write_dataset_config", action="store_true", help="Write the dataset config file on completion")
+parser.add_argument("--processes", type=int, default=0, help="Number of processes to use. Defaults to cpu count.")
+
 args = parser.parse_args()
+if not args.output_dir.endswith("/"):
+    args.output_dir = args.output_dir + "/"
+if not args.input_dir.endswith("/"):
+    args.input_dir = args.input_dir + "/"
+assert len(args.separator) == 1 
 
-
-# Helper functions and classes
 
 def _int64_feature(value):
-    """Returns an int64_list from a bool / enum / int / uint."""
+    """
+    Returns an int64_list from a bool / enum / int / uint.
+    """
     return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
 
+def write_to_file(writer, data):
+    """
+    writes data to tfrecord file
+    """
+    feature = {
+        "text": _int64_feature(data)
+    }
+    tf_example = tf.train.Example(features=tf.train.Features(feature=feature))
+    writer.write(tf_example.SerializeToString())
 
-def _bytes_feature(value):
-    """Returns a bytes_list from a string / byte."""
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+def get_tokenizer(args):
+    if args.encoder_path is None:
+        return GPT2TokenizerFast.from_pretrained('gpt2')
+    else:
+        return Tokenizer.from_file(args.encoder_path)
 
+def split_list(l, n):
+    # splits list/string into n size chunks
+    return [l[i:i+n] for i in range(0, len(l), n)]
 
-def chunks(l, n):
-    # Divides a list into chunks
-    out = []
-    for i in range(0, len(l), n):
-        out.append(l[i:i + n])
-    return out
+def archive_to_tokens(f, encoder, args):
+    # Generator that yields the contents of the files in an archive
+    # if data_to_prepend is not None, prepend data_to_prepend + a EOS separator to the encoded data 
+    reader = Reader(f)
+    for doc in reader.stream_data(threaded=False):
+        # doc = [int(i) for i in doc.split(", ")] + args.separator # for testing
+        doc = encoder.encode(doc) + args.separator # read document from lmd and append separator token
+        yield split_list(doc, args.chunk_size) # split into n_ctx + 1 size chunks
 
+def write_files(files, files_per, output_dir, out_name, start_no, write_remainder=False, process_no=None):
+    # writes a list of files to .tfrecords
+    if files == None:
+        return
+    chunks = split_list(files, files_per)
 
-def read_in_chunks(stream, chunk_size=2048):
-    # Read a stream in chunk_size sized chunks
-    while True:
-        data = stream.read(chunk_size)
-        if len(data) == 0:
-            break
-        yield data
+    if len(chunks[-1]) != files_per and not write_remainder: # pop the last file if it's length != files per
+        remainder = chunks.pop(-1)
+    else:
+        remainder = None # assuming files = remainder from an old chunk here
+        files_per = len(chunks[-1])
 
+    for files in chunks:
+        fp = f"{output_dir}/{out_name}_{start_no}"
+        if process_no is not None:
+            fp += f"_{process_no}"
+        fp += f"_{files_per}" # add number of files in tfrecord to end of fp
+        fp += ".tfrecords"
+        with tf.io.TFRecordWriter(fp) as writer:
+            for f in files:
+                write_to_file(writer, f)
+        start_no += 1
+    return start_no, remainder
+                    
+def get_files(input_dir, filetypes=None):
+    # gets all files of <filetypes> in input_dir
+    if filetypes == None:
+        filetypes = ["jsonl.zst", ".txt", ".xz", ".tar.gz"]
+    files = [list(Path(input_dir).glob(f"*{ft}")) for ft in filetypes]
+    return [str(item) for sublist in files for item in sublist] # flatten list of list -> list and stringify Paths
 
-def fetch_special_token_id(enc, special_token):
-    ids = enc.encode(special_token).ids
-    assert len(ids) == 1, f'Special token {special_token} is not assigned a unique id for the tokenizer'
-    return ids[0]
-
-
-class BufferedEncodedStream(object):
-    # Loads a file into memory, optionally fixes unicode, encodes it and adds the separator to the beginning
-    # If set to text_mode the input is assumed to not be a file but the direct string data
-    def __init__(self, inp, encoder, separator=None, fix=False, minimum_size=0, text_mode=False):
-        if text_mode:
-            d = inp
-        else:
-            with open(inp, "r") as f:
-                d = f.read()
-
-        if fix:
-            d = ftfy.fix_text(d, normalization='NFKC')
-
-        if args.use_gpt2_tokenizer:
-            self.data = encode(encoder, d, gpt=True)
-        else:
-            self.data = encode(encoder, d)
-
-        if len(self.data) < minimum_size or all([x == 0 for x in self.data]):  # Sanity check
-            self.data = []  # Don't return file contents if it doesn't pass the sanity check
-        elif separator is not None:  # Only add separator if sanity check didn't failt
-            self.data = separator + self.data  # separator should be [tokens]
-
-        self.idx = 0
-        self.n = len(self.data)
-
-    def read(self, size=None):
-        if self.idx < self.n:
-            if size is None or size < 0:
-                chunk = self.data[self.idx:]
-                self.idx = self.n
-            else:
-                chunk = self.data[self.idx:self.idx + size]
-                self.idx += len(chunk)
-            return chunk
-        else:
-            return []
-
-
-class EncodedCompressedReader:
-    # Loads, encodes and concatenates the texts within a zst archive
-    # Pass a archive, returns a stream of its concatenated contents
-    def __init__(self, f, encoder, separator=None, fix=False, minimum_size=0):
-        def _gen():
-            # Generator yielding the files inside the archive as encoded streams
-            g = Reader(f).stream_data(threaded=False)
-            for s in g:
-                yield BufferedEncodedStream(s, encoder, separator, fix, minimum_size, text_mode=True)
-
-        self.g = _gen()
-
+def read_checkpoint(checkpoint_path, resume_from_checkpoint=True):
+    # init checkpointing
+    if resume_from_checkpoint and os.path.isfile(checkpoint_path):
         try:
-            self.current = next(
-                self.g)  # Current is, whenever possible, pointing to the currently opened stream in the archive
-        except StopIteration:
-            self.current = None
+            resume_files_processed, tfrecord_count = [int(i) for i in open(checkpoint_path, "r").read().split(", ")]
+            print(f"\nResuming from tfrecord no. {tfrecord_count} / file no. {resume_files_processed}")
+            return resume_files_processed, tfrecord_count
+        except:
+            pass
+    return 0, 0
 
-    def read(self, size=None):
-        if size < 0:
-            size = None
-        remaining = size
-        data = []
+def create_tfrecords(params, write_remainder=True, write_every_n_files=1, save_checkpoints=False, resume_from_checkpoint=False, display_pbar=False):
+    # iterates through files in input_dir, splitting into <args.chunk_size> chunks and saving a tfrecords file every <args.files_per> chunks.
+    files, args, process_no = params
+    enc = get_tokenizer(args) # get tokenizer
 
-        while self.current and (remaining > 0 or remaining is None):
-            data_read = self.current.read(remaining or -1)
-            if len(data_read) < remaining or remaining is None:  # Exhausted file
-                try:
-                    self.current = next(self.g)
-                except StopIteration:
-                    self.current = None
-            if not remaining is None:
-                remaining -= len(data_read)
-            data.extend(data_read)
+    # init metadata
+    tfrecord_count = 0
+    discarded_files = 0
+    files_processed = 0
+    pbar = tqdm(desc=f"Writing TFRecord Files to {args.output_dir}. Parsed 0 input files. files_written ", disable= not display_pbar)
+    checkpoint_path = f"{args.output_dir}/checkpoint.txt"
+    resume_files_processed, tfrecord_count = read_checkpoint(checkpoint_path, resume_from_checkpoint)
+    
+    data_to_prepend = []
+    remainder = None
+    tokenized_files_array = []
 
-        return data
+    for f in files:
+        for tokenized_files in archive_to_tokens(f, enc, args):
+            files_processed += 1
+            if files_processed < resume_files_processed:
+                continue # resume from checkpoint
 
-
-class EncodedConcatenatedFiles(object):
-    # Stitches list of file names into a stream of properly encoded and seperated tokens
-    # Pass in a list of files and it outputs a stream of their contents stitched together
-    def __init__(self, fns, encoder, separator=None, fix=False, minimum_size=0):
-        self.fs = list(reversed(fns))  # reversed because read() reads from the last element first
-        self.enc = encoder
-        self.separator = separator  # separator should be [tokens]
-        self.fix = fix
-        self.minimum_size = minimum_size
-
-    def read(self, size=None):
-        if size < 0:
-            size = None
-        remaining = size
-        data = []
-
-        while self.fs and (remaining > 0 or remaining is None):
-            if isinstance(self.fs[-1], str):  # If the last element in the list is a string, it's an unopened file
-                if self.fs[-1].endswith(".zst") or self.fs[-1].endswith(
-                        ".xz") or self.fs[-1].endswith(
-                        "tar.gz"):  # If it's an archive, we use this reader
-                    self.fs[-1] = EncodedCompressedReader(self.fs[-1], self.enc, self.separator, self.fix,
-                                                          self.minimum_size)
-                else:  # Otherwise we assume it's a normal text file
-                    self.fs[-1] = BufferedEncodedStream(self.fs[-1], self.enc, self.separator, self.fix,
-                                                        self.minimum_size)
-
-            data_read = self.fs[-1].read(remaining or -1)
-            if len(
-                    data_read) < remaining or remaining is None:  # If we exhaust the file we're reading, pop it off the list
-                self.fs.pop()
-
-            if not remaining is None:
-                remaining -= len(data_read)
-            data.extend(data_read)
-
-        return np.array(data, np.int32)
-
-
-def create_file(params):
-    idx, fns = params
-    s = args.name + "_" + str(idx) + ".tfrecords"
-    if os.path.exists(os.path.join(args.log_dir,
-                                   s)):  # Hack-y, if file of same name is in log dir, sign that the file is complete, so skip
-        return 0
-    if os.path.exists(os.path.join(args.output_dir, s)):  # Unfinished file, remove
-        os.remove(os.path.join(args.output_dir, s))
-
-    with tf.io.TFRecordWriter(os.path.join(args.output_dir, s)) as writer:
-        def _write_to_file(data, i):
-            # Helper function to avoid code duplication, writes the data as an example to the file and increments i
-            # hash = fn.split("/")[-1].split(".")[0]
-            feature = {
-                # "hash": _bytes_feature(hash.encode()),
-                "text": _int64_feature(data)
-            }
-            tf_example = tf.train.Example(features=tf.train.Features(feature=feature))
-            writer.write(tf_example.SerializeToString())
-            i += 1
-
-        i = 0  # In document mode: Good files, in chunk mode: Number of chunks
-        if args.mode == "documents":
-            def _archive_to_files(f):
-                # Generator that yields the contents of the files in an archive
-                g = Reader(f).stream_data(threaded=False)
-                for s in g:
-                    yield BufferedEncodedStream(s, enc, [], not args.no_ftfy, args.minimum_size, text_mode=True).read()
-
-            for fn in fns:
-                if fn.endswith(".zst") or fn.endswith(".xz") or fn.endswith("tar.gz"):
-                    data = _archive_to_files(fn)
+            # if the last chunk < chunk size, but > minimum_size, take it and append it to the beginning of the next file
+            n_tokens = len(tokenized_files[-1])
+            if n_tokens < args.chunk_size:
+                data = tokenized_files.pop(-1)
+                if n_tokens >= args.minimum_size:
+                    data_to_prepend.extend(data)
                 else:
-                    data = [BufferedEncodedStream(fn, enc, args.separator, not args.no_ftfy, args.minimum_size).read()]
+                    discarded_files += 1
 
-                for d in data:
-                    _write_to_file(d, i)
+            if len(data_to_prepend) >= args.chunk_size:
+                # if length of data_to_prepend becomes greater than chunk size, add concatted files to tokenized files
+                tokenized_files_array.append(data_to_prepend[:args.chunk_size])
+                data_to_prepend = data_to_prepend[args.chunk_size:]
+            # add tokenized files > chunk size to main array
+            tokenized_files_array.extend(tokenized_files)
 
-        elif args.mode == "chunks":
-            data_stream = EncodedConcatenatedFiles(fns, enc, separator=args.separator, fix=not args.no_ftfy,
-                                                   minimum_size=args.minimum_size)
-            data_stream = read_in_chunks(data_stream, args.chunk_size)
-            for chunk in data_stream:
-                if not chunk.shape[0] == args.chunk_size:  # Additional sanity check
-                    continue
-                _write_to_file(chunk, i)
+            if len(tokenized_files_array) >= args.files_per * write_every_n_files: # write every n files
+                _tfrecord_count, remainder = write_files(tokenized_files_array, files_per=args.files_per, output_dir=args.output_dir, out_name=args.name, start_no = tfrecord_count, process_no=process_no)
+                pbar.update(_tfrecord_count - tfrecord_count) # update progress bar
+                pbar.set_description(f"Writing TFRecord Files to {args.output_dir}. Parsed {files_processed} input files. files_written ")
+                tfrecord_count = _tfrecord_count
+                tokenized_files_array = remainder if remainder is not None else [] # add remaining files to next chunk
+                with open(checkpoint_path, "w") as checkpoint_file:
+                    checkpoint_file.write(f"{files_processed}, {tfrecord_count}")
 
-    # File complete
-    if args.mode == "documents":
-        with open(os.path.join(args.log_dir, s), "w") as f:  # Create mark that file is finished in logdir
-            f.write("{} / {}".format(i, len(fns)))  # How many files were good
-        with open(os.path.join(args.log_dir, "good_files.log"), "a") as f:
-            f.write("{}: {} / {}".format(idx, i, len(fns)))
+    if len(tokenized_files_array) >= args.files_per: # also write at end
+        _tfrecord_count, remainder = write_files(tokenized_files_array, files_per=args.files_per, output_dir=args.output_dir, out_name=args.name, start_no=tfrecord_count, process_no=process_no)
+        pbar.update(_tfrecord_count - tfrecord_count)
+        pbar.set_description(f"Writing TFRecord Files to {args.output_dir}. Parsed {files_processed} input files. files_written ")
+        tfrecord_count = _tfrecord_count
+        tokenized_files_array = remainder if remainder is not None else []
+        with open(checkpoint_path, "w") as checkpoint_file:
+            checkpoint_file.write(f"{files_processed}, {tfrecord_count}")
+    else:
+        remainder = tokenized_files_array # add remaining to remainder
 
-    elif args.mode == "chunks":
-        with open(os.path.join(args.log_dir, s), "w") as f:  # Create mark that file is finished in logdir
-            f.write("{}".format(i))  # How many chunks
-        with open(os.path.join(args.log_dir, "chunks.log"), "a") as f:
-            f.write("{}: {}".format(idx, i))
+    if write_remainder:
+        # write out the remaining files even if there's less than files_per
+        write_files(remainder, files_per=args.files_per, output_dir=args.output_dir, out_name=args.name, start_no=tfrecord_count, write_remainder=True)
 
-    return i
+    successful_files = files_processed - discarded_files
+    return {"discarded": discarded_files, "processed": files_processed, "successful": successful_files}
+
+def create_tfrecords_mp(files, args):
+    files = split_list(files, len(files) // args.processes)
+    with Pool(processes=args.processes) as pool:
+        pbar = tqdm(pool.imap(create_tfrecords, zip(files, repeat(args), range(len(files)))))
+        meta = {"discarded": 0, "processed": 0, "successful": 0}
+        for results in pbar:
+            pbar.update()
+            for k, v in results.items():
+                meta[k] += v # update metadata
+        return meta
 
 
 if __name__ == "__main__":
-    Path(args.log_dir).mkdir(exist_ok=True)
-    Path(args.output_dir).mkdir(exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True) # make output dir if it doesn't exist
+    files = get_files(args.input_dir)
+    args.chunk_size += 1 # we shift the data by 1 to the right for targets, so increment the chunk size here
 
-    if args.use_gpt2_tokenizer:
-        enc = GPT2TokenizerFast.from_pretrained('gpt2')
+    if args.processes == 0:
+        args.processes = cpu_count()
+    if args.processes > 1:
+        results = create_tfrecords_mp(files, args)
     else:
-        enc = Tokenizer.from_file(args.encoder_path)
-
-    args.separator = json.loads(args.separator)  # Encode the separator to list
-    files = glob.glob(os.path.join(args.base_dir, "*"))  # TODO make this more flexible maybe?
-    files = [f for f in files if not os.path.isdir(f)]
-    file_chunks = chunks(files, args.files_per)  # Assign files_per file to a tfrecord file each
-    args.chunk_size = args.chunk_size + 1  # Chunks need to be 1 token longer so there's a target for the last token
-
-    print("Got {} files, divided into {} chunks.".format(str(len(files)), str(len(file_chunks))))
-
-    start = time.time()
-    pool = Pool(processes=args.processes)
-    ret = 0
-    for i in tqdm(pool.imap(create_file, enumerate(file_chunks)), total=len(file_chunks)):
-        ret += i
-    end = time.time()
-
-    if args.mode == "documents":
-        print("Done! In {:.2f}s, {} / {} good files.".format(end - start, ret, len(files)))
-    elif args.mode == "chunks":
-        print("Done! In {:.2f}s, {} chunks.".format(end - start, ret))
-
-    if args.write_dataset_config:
-        write_file_path = f'./configs/dataset_configs/{args.name}.json'
-
-        with open(write_file_path, 'w') as f:
-            output_path = Path(args.output_dir)
-
-            dataset_config = {
-                "path": str(output_path / f"{args.name}_*.tfrecords"),
-                "eval_path": "",
-            }
-
-            if args.use_gpt2_tokenizer:
-                dataset_config.update(**{
-                    "n_vocab": 50256,
-                    "tokenizer_is_pretrained": True,
-                    "tokenizer_path": "gpt2",
-                    "eos_id": 50256,
-                    "padding_id": 50257
-                })
-            else:
-                dataset_config.update(**{
-                    "n_vocab": enc.get_vocab_size(),
-                    "tokenizer_path": str(args.encoder_path),
-                    "eos_id": fetch_special_token_id(enc, "<|endoftext|>"),
-                    "padding_id": fetch_special_token_id(enc, "<|padding|>")
-                })
-
-            f.write(json.dumps(dataset_config, indent=2))
-
-        print(f'Dataset config written to {write_file_path}!')
-        logging.getLogger("transformers").setLevel(logging.WARNING)
-
+        results = create_tfrecords((files, args, 0), display_pbar=True)
+    print(results)

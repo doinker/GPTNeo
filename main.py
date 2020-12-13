@@ -7,7 +7,8 @@ from tensorflow.python.tpu import tpu_config, tpu_estimator
 from tensorflow_estimator.python.estimator import estimator as estimator_lib
 from utils import save_config, expand_attention_types_params, yes_or_no, remove_gs_or_filepath, setup_logging, \
     check_dataset
-from inputs import generic_text, pred_input, handle_pred_output, mlm_sample_text
+from inputs import sequential_input, pred_input, handle_pred_output, mlm_sample_text, generic_text
+from export import export_model
 from model_fns import model_fn
 from data.encoders import fetch_encoder
 from configs import fetch_model_params
@@ -40,6 +41,8 @@ def parse_args():
     parser.add_argument("--check_dataset", action="store_true",
                         help="If set, outputs sample from the dataset and quits.")
     parser.add_argument("--sacred_id", type=str, default="nosacred", help="Sacred run id.")
+    parser.add_argument("--entmax_sampling", action="store_true", help="(experimental) use entmax sampling")
+    parser.add_argument("--export", action="store_true", help="If set, will export the model.")
     args = parser.parse_args()
     assert args.model is not None, "Model must be set"
     return args
@@ -53,13 +56,24 @@ def main(args):
     params = fetch_model_params(args.model)
 
     # Fetch appropriate input functions
-    input_fn = generic_text
+    input_fn = params.get("input_fn", "sequential_input")
+    if input_fn == "sequential_input":
+        input_fn = sequential_input
+    elif input_fn == "generic_text":
+        input_fn = generic_text
     pred_input_fn = pred_input
     handle_pred_output_fn = handle_pred_output
+
+    # get current step
+    current_step = int(estimator_lib._load_global_step_from_checkpoint_dir(params["model_path"]))
+    logger.info(f"Current step {current_step}")
 
     if params["mlm_training"]:
         mlm_sample_text_fn = partial(mlm_sample_text, params)
         input_fn = partial(generic_text, sample_text_fn=mlm_sample_text_fn)
+        if args.check_dataset:
+            check_dataset(input_fn, params)
+
 
     # Fetch encoder per params
     encoder = fetch_encoder(params)
@@ -68,7 +82,7 @@ def main(args):
 
     # Sample from Dataset if check dataset flag is on
     if args.check_dataset:
-        check_dataset(input_fn, params)
+        check_dataset(input_fn, params, global_step=current_step)
 
     # Confirm deletion of checkpoint files if --new flag is set
     if args.new:
@@ -94,6 +108,9 @@ def main(args):
     params["predict_batch_size"] = params.get("predict_batch_size", 1)  # Default to 1
     params["predict"] = args.predict
     params['model'] = params.get("model", "GPT") # Default model selection to GPT since it's the only option for now
+    params["export"] = args.export
+    # Set sampling parameters
+    params["sampling_use_entmax"] = args.entmax_sampling
 
     # Sample quality of MoE models suffers when using the faster sampling method, so default to slow_sampling if
     # moe layers are present
@@ -155,8 +172,9 @@ def main(args):
         for task in eval_tasks
     }
 
-    current_step = int(estimator_lib._load_global_step_from_checkpoint_dir(params["model_path"]))
-    logger.info(f"Current step {current_step}")
+    if args.export:
+        export_model(estimator, "export", params)
+        return
 
     if args.predict:
         # Predict
@@ -166,8 +184,25 @@ def main(args):
         handle_pred_output_fn(predictions, logger, enc, params, out_name=f"predictions_{args.sacred_id}_{current_step}")
         return
 
+    def save_eval_results(task, eval_results):
+        def as_python(x):
+            if isinstance(x, numpy.generic):
+                return x.item()
+            return x
+        eval_results = {k: as_python(v) for k, v in eval_results.items()}
+        with open(f'eval_{args.sacred_id}.jsonl', 'a') as fh:
+            json.dump({'task': task, 'current_step': current_step, **eval_results}, fh)
+            fh.write('\n')
 
-    if args.eval:
+    def run_eval():
+        logger.info("Running evaluation...")
+        eval_results = estimator.evaluate(
+                input_fn=partial(input_fn, eval=True),
+                steps=params["eval_steps"])
+        logger.info(f"Eval results: {eval_results}")
+        save_eval_results('validation', eval_results)
+
+    def run_eval_tasks():
         for task in eval_tasks:
             logger.info(f"Starting evaluation task '{task}'")
             task_info = task_descriptors[task]["get_task_info_fn"](params)
@@ -178,6 +213,10 @@ def main(args):
                 steps=task_info["n_steps"],
                 name=task)
             logger.info(f"Eval task '{task}' results: {eval_results}")
+    
+    if args.eval:
+        run_eval_tasks()
+        run_eval()
         return
 
 
@@ -187,18 +226,8 @@ def main(args):
             next_checkpoint = min(current_step + args.steps_per_checkpoint,
                                   params["train_steps"])
 
-            estimator.train(input_fn=partial(input_fn, eval=False), max_steps=next_checkpoint)
+            estimator.train(input_fn=partial(input_fn, global_step=current_step, eval=False), max_steps=next_checkpoint)
             current_step = next_checkpoint
-
-            def save_eval_results(task, eval_results):
-                def as_python(x):
-                     if isinstance(x, numpy.generic):
-                        return x.item()
-                     return x
-                eval_results = {k: as_python(v) for k, v in eval_results.items()}
-                with open(f'eval_{args.sacred_id}.jsonl', 'a') as fh:
-                    json.dump({'task': task, 'current_step': current_step, **eval_results}, fh)
-                    fh.write('\n')
 
             if params["predict_steps"] > 0:
                 logger.info("Running prediction...")
@@ -207,31 +236,17 @@ def main(args):
                 handle_pred_output_fn(predictions, logger, enc, params, out_name=f"predictions_{args.sacred_id}_{current_step}")
 
             if params["eval_steps"] > 0:
-                logger.info("Running evaluation...")
-                eval_results = estimator.evaluate(
-                    input_fn=partial(input_fn, eval=True),
-                    steps=params["eval_steps"])
-                logger.info(f"Eval results: {eval_results}")
-                save_eval_results('validation', eval_results)
+                run_eval()
 
-            for task in eval_tasks:
-                logger.info(f"Starting evaluation task '{task}'")
-                task_info = task_descriptors[task]["get_task_info_fn"](params)
-                task_estimator = eval_task_estimators[task]
-                task_input_fn = task_descriptors[task]["input_fn"]
-                eval_results = task_estimator.evaluate(
-                    input_fn=task_input_fn,
-                    steps=task_info["n_steps"],
-                    name=task)
-                logger.info(f"Eval task '{task}' results: {eval_results}")
-                save_eval_results(task, eval_results)
+            if eval_tasks:
+                run_eval_tasks()
                 
         return
     else:
         # Else, just train
         while current_step < params["train_steps"]:
             # Else, don't stop and restart
-            estimator.train(input_fn=partial(input_fn, eval=False), max_steps=params["train_steps"])
+            estimator.train(input_fn=partial(input_fn, global_step=current_step, eval=False), max_steps=params["train_steps"])
 
 
 if __name__ == "__main__":
